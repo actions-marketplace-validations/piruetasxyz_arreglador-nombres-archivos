@@ -27570,7 +27570,14 @@ const CONVENTIONAL_NAMES = new Set([
   'security.md',
   'authors', 'authors.md',
   'notice', 'notice.md',
+  'main.cpp',
 ]);
+
+const PASCAL_CASE_EXTS = new Set(['.h', '.cpp']);
+
+const INCLUDE_SOURCE_EXTS = new Set(['.ino', '.h', '.hpp', '.c', '.cpp']);
+
+const INCLUDE_REGEX = /(#\s*include\s*")([^"\/\\]+)(")/g;
 
 function isIgnored(name) {
   return name.startsWith('.') || IGNORED_DIR_NAMES.has(name);
@@ -27598,13 +27605,29 @@ function slugify(str, separator = '-') {
     .replace(/^[-_]+|[-_]+$/g, '');
 }
 
+function pascalCase(str) {
+  return str
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join('');
+}
+
 function normalizeName(filename) {
   if (CONVENTIONAL_NAMES.has(filename.toLowerCase())) return filename;
 
   const ext = path.extname(filename);
-  const separator = ['.ino', '.pde'].includes(ext.toLowerCase()) ? '_' : '-';
+  const extLower = ext.toLowerCase();
   const base = ext ? filename.slice(0, -ext.length) : filename;
-  const fixedBase = slugify(base, separator) || 'archivo';
+  let fixedBase;
+  if (PASCAL_CASE_EXTS.has(extLower)) {
+    fixedBase = pascalCase(base) || 'Archivo';
+  } else {
+    const separator = ['.ino', '.pde'].includes(extLower) ? '_' : '-';
+    fixedBase = slugify(base, separator) || 'archivo';
+  }
   const fixedExt = ext ? '.' + slugify(ext.slice(1)) : '';
   return fixedBase + fixedExt;
 }
@@ -27661,21 +27684,64 @@ function planRenames(rootDir) {
   return { changes, conflicts };
 }
 
+function planIncludeUpdates(changes) {
+  const renamesByDir = new Map();
+  for (const { dir, base, fixed } of changes) {
+    if (!renamesByDir.has(dir)) renamesByDir.set(dir, new Map());
+    renamesByDir.get(dir).set(base.toLowerCase(), fixed);
+  }
+
+  const updates = [];
+
+  for (const [dir, renames] of renamesByDir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      if (!INCLUDE_SOURCE_EXTS.has(path.extname(entry.name).toLowerCase())) continue;
+
+      const filePath = path.join(dir, entry.name);
+      const content = fs.readFileSync(filePath, 'utf8');
+      const replaced = [];
+      const newContent = content.replace(INCLUDE_REGEX, (match, open, name, close) => {
+        const fixed = renames.get(name.toLowerCase());
+        if (!fixed || fixed === name) return match;
+        replaced.push({ name, fixed });
+        return open + fixed + close;
+      });
+
+      if (replaced.length > 0) {
+        const finalName = renames.get(entry.name.toLowerCase()) || entry.name;
+        updates.push({ filePath: path.join(dir, finalName), newContent, replaced });
+      }
+    }
+  }
+
+  return updates;
+}
+
 try {
   const start = Date.now();
   const shouldFix = core.getBooleanInput('arreglar');
   const rootDir = process.cwd();
 
   const { changes, conflicts } = planRenames(rootDir);
+  const includeUpdates = planIncludeUpdates(changes);
 
   if (shouldFix) {
     for (const { dir, base, fixed } of changes) {
       fs.renameSync(path.join(dir, base), path.join(dir, fixed));
     }
+    for (const { filePath, newContent } of includeUpdates) {
+      fs.writeFileSync(filePath, newContent);
+    }
   }
 
   for (const { before, after } of changes) {
     core.info(`${before} -> ${after}`);
+  }
+  for (const { filePath, replaced } of includeUpdates) {
+    for (const { name, fixed } of replaced) {
+      core.info(`${path.relative(rootDir, filePath)}: #include "${name}" -> #include "${fixed}"`);
+    }
   }
   for (const { before, after } of conflicts) {
     core.warning(`conflicto: ${before} -> ${after}`);
